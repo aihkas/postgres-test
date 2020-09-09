@@ -146,6 +146,7 @@ podTemplate(
 
       dir(workdir) {
         container("postgres") {
+          sh "echo $postgresPassword $postgresServerlessPassword $postgresAdminUsername"
           // Prevent logging password to jenkins
           sh """
             #!/usr/bin/env bash
