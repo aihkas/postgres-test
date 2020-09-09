@@ -65,14 +65,6 @@ podTemplate(
       }
     }
 
-    stage('Replace DB stack') {
-      dir(workdir) {
-        container("aws-cli") {
-          sh "./db-stack.sh ${params.EnvType} ${params.MySQLSnapshotID} ${params.PostgreSQLSnapshotID} ${params.PostgreSQLServerlessSnapshotID}"
-        }
-      }
-    }
-
     stage('Set MySQL Credentials') {
       def mysqlPassword;
       def mysqlAdminUsername;
