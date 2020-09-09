@@ -1,0 +1,84 @@
+@Library("gleerups") _
+
+properties([
+  parameters([
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'EnvType',
+      script: parameterScript("getNamespaces")
+    ],
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'PostgreSQLServerlessSnapshotID',
+      script: parameterScript("getRdsClusterSnapshot", [
+        dbIdentifier: "new-prod-postgres-serverless"
+      ])
+    ],
+  ])
+])
+
+def label = "mypod-${UUID.randomUUID().toString()}"
+def workdir = "jenkins/pipelines/clone-postgres-serverless-prod-db"
+
+podTemplate(
+  name: "clone-postgres-serverless-prod-db",
+  label: label,
+  containers: [
+    containerTemplate(name: 'aws-cli', image: 'cgswong/aws:latest', envVars: [envVar(key: 'AWS_METADATA_SERVICE_NUM_ATTEMPTS', value: '5')], ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+    containerTemplate(name: 'postgres', image: 'postgres:9.6.1', ttyEnabled: true, alwaysPullImage: false, command: 'cat'),
+  ],
+  annotations: [
+    podAnnotation(key: "iam.amazonaws.com/role", value: "jenkinsKubernetesRole")
+  ]
+) {
+
+  currentBuild.displayName = "Restore to ${EnvType}"
+  currentBuild.description = "${PostgreSQLServerlessSnapshotID}"
+
+  node(label) {
+    stage('Checkout') {
+      checkout scm
+    }
+
+    stage('Validate parameters') {
+      if(params.EnvType.contains("prod")) {
+        throw new Exception('I do not opperate under such pressure')
+      }
+    }
+
+    stage('Replace DB stack') {
+      dir(workdir) {
+        container("aws-cli") {
+          sh "./postgres-db-serverless-stack.sh ${params.EnvType} ${params.PostgreSQLServerlessSnapshotID}"
+        }
+      }
+    }
+
+    stage('Set PostgreSQLServerless Credentials') {
+      def postgresPassword;
+      def postgresAdminUsername;
+      def postgresAdminPassword;
+
+      container("aws-cli") {
+        sh "aws configure set default.region eu-west-1"
+
+        postgresPassword = sh returnStdout: true, script: "./utils/get-secret.sh /development/rds/postgres/resultbox-password"
+        postgresAdminUsername = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/postgres/admin/username"
+        postgresAdminPassword = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/postgres/admin/password"
+      }
+
+      dir(workdir) {
+        container("postgres") {
+          // Prevent logging password to jenkins
+          sh """
+            #!/usr/bin/env bash
+            set +x
+            ./set-postgres-serverless-credentials.sh ${params.EnvType} resultbox $postgresPassword $postgresAdminUsername $postgresAdminPassword
+          """
+        }
+      }
+    }
+  }
+}

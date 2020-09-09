@@ -1,0 +1,171 @@
+@Library("gleerups") _
+
+properties([
+  parameters([
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'EnvType',
+      script: parameterScript("getNamespaces")
+    ],
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'PostgreSQLSnapshotID',
+      script: parameterScript("getRdsSnapshot", [
+        dbIdentifier: "new-prod-postgres"
+      ])
+    ],
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'MySQLSnapshotID',
+      script: parameterScript("getRdsSnapshot", [
+        dbIdentifier: "new-prod-mysql"
+      ])
+    ],
+    [
+      $class: 'ChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'PostgreSQLServerlessSnapshotID',
+      script: parameterScript("getRdsClusterSnapshot", [
+        dbIdentifier: "new-prod-postgres-serverless"
+      ])
+    ],
+  ])
+])
+
+def label = "mypod-${UUID.randomUUID().toString()}"
+def workdir = "jenkins/pipelines/clone-prod-db"
+
+podTemplate(
+  name: "clone-db",
+  label: label,
+  containers: [
+    containerTemplate(name: 'aws-cli', image: 'cgswong/aws:latest', envVars: [envVar(key: 'AWS_METADATA_SERVICE_NUM_ATTEMPTS', value: '5')], ttyEnabled: true, alwaysPullImage: true, command: 'cat'),
+    containerTemplate(name: 'postgres', image: 'postgres:9.6.1', ttyEnabled: true, alwaysPullImage: false, command: 'cat'),
+    containerTemplate(name: 'mysql', image: 'mysql:latest', ttyEnabled: true, alwaysPullImage: false, command: 'cat')
+  ],
+  annotations: [
+    podAnnotation(key: "iam.amazonaws.com/role", value: "jenkinsKubernetesRole")
+  ]
+) {
+
+  currentBuild.displayName = "Restore to ${EnvType}"
+  currentBuild.description = "${PostgreSQLSnapshotID}, ${MySQLSnapshotID}, ${PostgreSQLServerlessSnapshotID}"
+
+  node(label) {
+    stage('Checkout') {
+      checkout scm
+    }
+
+    stage('Validate parameters') {
+      if(params.EnvType.contains("prod")) {
+        throw new Exception('I do not opperate under such pressure')
+      }
+    }
+
+    stage('Replace DB stack') {
+      dir(workdir) {
+        container("aws-cli") {
+          sh "./db-stack.sh ${params.EnvType} ${params.MySQLSnapshotID} ${params.PostgreSQLSnapshotID} ${params.PostgreSQLServerlessSnapshotID}"
+        }
+      }
+    }
+
+    stage('Set MySQL Credentials') {
+      def mysqlPassword;
+      def mysqlAdminUsername;
+      def mysqlAdminPassword;
+      def mysqlReadPassword
+
+      container("aws-cli") {
+        result=sh returnStdout: true, script: "aws configure set default.region eu-west-1"
+        if (result?.trim()) {
+            print "Non-empty result from aws-configure. Sleeping"
+            sleep(5*60*60*1000)
+        }
+
+        mysqlPassword = sh returnStdout: true, script: "./utils/get-secret.sh /development/migrated/rds/dev/mysql/app/password"
+        mysqlItcmPassword = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/mysql/itcm/password"
+        mysqlMigrationPassword = sh returnStdout: true, script: "./utils/get-secret.sh /development/migrated/rds/dev/mysql/migration/password"
+        mysqlAdminUsername = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/mysql/admin/username"
+        mysqlAdminPassword = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/mysql/admin/password"
+      }
+
+      dir(workdir) {
+        container("mysql") {
+          // Prevent logging password to jenkins
+          echo "Setting Credentials"
+
+          sh """
+            #!/usr/bin/env bash
+            set +x
+
+            # Env user
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}_user" $mysqlPassword $mysqlAdminUsername $mysqlAdminPassword --write-access
+
+            # Readonly user
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}_itcm_user" $mysqlItcmPassword $mysqlAdminUsername $mysqlAdminPassword
+
+            # Legacy migration user
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}_migration_user" $mysqlMigrationPassword $mysqlAdminUsername $mysqlAdminPassword --full-access
+
+            # App specific migration users
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}-qb-migration" $mysqlMigrationPassword $mysqlAdminUsername $mysqlAdminPassword --full-access
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}-ab-migration" $mysqlMigrationPassword $mysqlAdminUsername $mysqlAdminPassword --full-access
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}-tb-migration" $mysqlMigrationPassword $mysqlAdminUsername $mysqlAdminPassword --full-access
+            ../clone-mysql-prod-db/set-mysql-credentials.sh ${params.EnvType} "${params.EnvType}-core-migration" $mysqlMigrationPassword $mysqlAdminUsername $mysqlAdminPassword --full-access
+          """
+
+          echo "Grant admin access to LiSA and Rättighetssystem"
+
+          sh """
+            #!/usr/bin/env bash
+            set +x
+            ../clone-mysql-prod-db/grant-admin-access.sh ${params.EnvType} $mysqlAdminUsername $mysqlAdminPassword
+          """
+        }
+      }
+    }
+
+    stage('Switch DB Storage') {
+      dir(workdir) {
+        container("aws-cli") {
+          sh "../clone-mysql-prod-db/switch-storage.sh ${params.EnvType}"
+        }
+      }
+    }
+
+    stage('Set PostgreSQL and PostgresSQLServerless Credentials') {
+      def postgresPassword;
+      def postgresServerlessPassword;
+      def postgresAdminUsername;
+      def postgresAdminPassword;
+
+      container("aws-cli") {
+        sh "aws configure set default.region eu-west-1"
+
+        postgresPassword = sh returnStdout: true, script: "./utils/get-secret.sh /development/migrated/rds/dev/postgres/app/password"
+        postgresServerlessPassword = sh returnStdout: true, script: "./utils/get-secret.sh /development/rds/postgres/resultbox-password"
+        postgresAdminUsername = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/postgres/admin/username"
+        postgresAdminPassword = sh returnStdout: true, script: "./utils/get-secret.sh /production/migrated/rds/production/postgres/admin/password"
+      }
+
+      dir(workdir) {
+        container("postgres") {
+          // Prevent logging password to jenkins
+          sh """
+            #!/usr/bin/env bash
+            set +x
+            ../clone-postgres-prod-db/set-postgres-credentials.sh ${params.EnvType} em_user $postgresPassword $postgresAdminUsername $postgresAdminPassword
+            ../clone-postgres-prod-db/set-postgres-credentials.sh ${params.EnvType} notifications_user $postgresPassword $postgresAdminUsername $postgresAdminPassword
+            ../clone-postgres-prod-db/set-postgres-credentials.sh ${params.EnvType} ilt_user $postgresPassword $postgresAdminUsername $postgresAdminPassword
+            ../clone-postgres-prod-db/set-postgres-credentials.sh ${params.EnvType} planner_user $postgresPassword $postgresAdminUsername $postgresAdminPassword
+            ../clone-postgres-serverless-prod-db/set-postgres-serverless-credentials.sh ${params.EnvType} resultbox $postgresServerlessPassword $postgresAdminUsername $postgresAdminPassword
+          """
+        }
+      }
+    }
+  }
+}
