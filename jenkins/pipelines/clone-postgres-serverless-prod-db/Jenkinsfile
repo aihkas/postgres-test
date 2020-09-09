@@ -48,14 +48,6 @@ podTemplate(
       }
     }
 
-    stage('Replace DB stack') {
-      dir(workdir) {
-        container("aws-cli") {
-          sh "./postgres-db-serverless-stack.sh ${params.EnvType} ${params.PostgreSQLServerlessSnapshotID}"
-        }
-      }
-    }
-
     stage('Set PostgreSQLServerless Credentials') {
       def postgresPassword;
       def postgresAdminUsername;
@@ -70,6 +62,7 @@ podTemplate(
       }
 
       dir(workdir) {
+        sh "echo dev pass $postgresPassword $postgresAdminUsername"
         container("postgres") {
           // Prevent logging password to jenkins
           sh """
